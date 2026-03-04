@@ -8,6 +8,7 @@ from flask import Flask, request, render_template_string, redirect
 from bs4 import BeautifulSoup
 import uuid
 from urllib.parse import urlparse
+import re
 
 app = Flask(__name__)
 
@@ -16,32 +17,44 @@ EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 SMS_TO = os.getenv("SMS_TO")
 
-# Products: key=unique_id, value=dict
 products = {}
 
 HTML = """
 <h2>Add Product</h2>
 <form method="post" action="/add">
-URL: <input name="url"><br>
-Target Price: <input name="price"><br>
+Product Name: <input name="name" required><br>
+URL: <input name="url" required><br>
+Target Price: <input name="price" required><br>
 <button type="submit">Add</button>
 </form>
 <hr>
-<h3>Tracked Products</h3>
+<h3>Tracked Products (up to 100)</h3>
+<table border="1" cellpadding="5">
+<tr><th>Store</th><th>Product Name</th><th>Current Price</th><th>Target Price</th><th>Notifications</th><th>Actions</th></tr>
 {% for pid, p in products.items() %}
-<p>
-{{p['url']}} - Target: ${{p['target']}} - Store: {{p['store']}} 
-<a href="/remove/{{pid}}">Remove</a> | 
-<a href="/edit/{{pid}}">Edit</a>
-</p>
+<tr>
+<td>{{p['store']}}</td>
+<td>{{p['name']}}</td>
+<td>${{p['current_price'] if p['current_price'] else 'N/A'}}</td>
+<td>${{p['target']}}</td>
+<td>
+<form method="post" action="/toggle/{{pid}}" style="display:inline">
+<input type="checkbox" name="notify" onchange="this.form.submit()" {% if p['notifications_on'] %}checked{% endif %}>
+Notify
+</form>
+</td>
+<td><a href="/remove/{{pid}}">Remove</a> | <a href="/edit/{{pid}}">Edit</a></td>
+</tr>
 {% endfor %}
+</table>
 """
 
 EDIT_HTML = """
 <h2>Edit Product</h2>
 <form method="post">
-URL: <input name="url" value="{{p['url']}}"><br>
-Target Price: <input name="price" value="{{p['target']}}"><br>
+Product Name: <input name="name" value="{{p['name']}}" required><br>
+URL: <input name="url" value="{{p['url']}}" required><br>
+Target Price: <input name="price" value="{{p['target']}}" required><br>
 <button type="submit">Update</button>
 </form>
 """
@@ -70,7 +83,7 @@ def get_store(url):
     else:
         return "Unknown"
 
-# Store-specific price parsers
+# Robust price parsers
 def get_price_amazon(soup):
     tag = soup.select_one("#priceblock_ourprice, #priceblock_dealprice")
     return float(tag.text.replace("$","").replace(",","")) if tag else None
@@ -84,12 +97,38 @@ def get_price_target(soup):
     return float(tag.text.replace("$","").replace(",","")) if tag else None
 
 def get_price_bestbuy(soup):
-    tag = soup.select_one("div[class*='priceView-hero-price'] span")
-    return float(tag.text.replace("$","").replace(",","")) if tag else None
+    # Hero price
+    tag = soup.select_one("div.priceView-hero-price span")
+    if tag and "$" in tag.text:
+        return float(tag.text.strip().replace("$","").replace(",",""))
+    # Alternate price span
+    tag_alt = soup.select_one("span.price")
+    if tag_alt and "$" in tag_alt.text:
+        return float(tag_alt.text.strip().replace("$","").replace(",",""))
+    # Fallback
+    for span in soup.find_all("span"):
+        if "$" in span.text:
+            try:
+                return float(span.text.strip().replace("$","").replace(",",""))
+            except:
+                continue
+    return None
 
 def get_price_microcenter(soup):
     tag = soup.select_one("span[id='pricing']")
-    return float(tag.text.replace("$","").replace(",","")) if tag else None
+    if tag:
+        match = re.search(r"\d+(\.\d+)?", tag.text.replace(",",""))
+        if match:
+            return float(match.group())
+    for span in soup.find_all("span"):
+        if "$" in span.text:
+            try:
+                match = re.search(r"\d+(\.\d+)?", span.text.replace(",",""))
+                if match:
+                    return float(match.group())
+            except:
+                continue
+    return None
 
 def extract_price(url, soup):
     store = get_store(url)
@@ -115,9 +154,18 @@ def add_product():
         return "Max 100 products reached", 400
     url = request.form["url"]
     target = float(request.form["price"])
+    name = request.form["name"]
     pid = str(uuid.uuid4())
     store = get_store(url)
-    products[pid] = {"url": url, "target": target, "store": store, "last_alert": 0}
+    products[pid] = {
+        "url": url,
+        "store": store,
+        "name": name,
+        "target": target,
+        "last_alert": 0,
+        "current_price": None,
+        "notifications_on": True
+    }
     return redirect("/")
 
 @app.route("/remove/<pid>", methods=["GET"])
@@ -131,11 +179,18 @@ def edit_product(pid):
     if pid not in products:
         return redirect("/")
     if request.method == "POST":
+        products[pid]["name"] = request.form["name"]
         products[pid]["url"] = request.form["url"]
         products[pid]["target"] = float(request.form["price"])
         products[pid]["store"] = get_store(request.form["url"])
         return redirect("/")
     return render_template_string(EDIT_HTML, p=products[pid])
+
+@app.route("/toggle/<pid>", methods=["POST"])
+def toggle_notifications(pid):
+    if pid in products:
+        products[pid]["notifications_on"] = "notify" in request.form
+    return redirect("/")
 
 def check_price(product):
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -145,7 +200,8 @@ def check_price(product):
         price = extract_price(product["url"], soup)
         if price is None:
             return
-        if price <= product["target"] and time.time() - product["last_alert"] > 86400:
+        product["current_price"] = price
+        if price <= product["target"] and product["notifications_on"] and time.time() - product["last_alert"] > 86400:
             send_sms(f"Deal Alert! ${price}\n{product['url']}")
             product["last_alert"] = time.time()
     except:
@@ -155,7 +211,7 @@ def monitor():
     while True:
         for product in list(products.values()):
             check_price(product)
-            time.sleep(30)  # staggered checks
+            time.sleep(30)
 
 threading.Thread(target=monitor, daemon=True).start()
 
