@@ -13,11 +13,12 @@ import re
 
 app = Flask(__name__)
 
-# Email-to-SMS settings
+# --- Email-to-SMS settings (set these as Render environment variables) ---
 EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 SMS_TO = os.getenv("SMS_TO")
 
+# --- Database ---
 DB_FILE = "products.db"
 products = {}  # key=UUID, value=dict
 
@@ -119,17 +120,23 @@ def delete_product_from_db(pid):
 
 # --- Email/SMS ---
 def send_sms(message):
+    if not EMAIL_ADDRESS or not EMAIL_PASSWORD or not SMS_TO:
+        print("Email/SMS not configured!")
+        return
     msg = MIMEText(message)
     msg['Subject'] = "Price Alert!"
     msg['From'] = EMAIL_ADDRESS
     msg['To'] = SMS_TO
-    with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
-        server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-        server.sendmail(EMAIL_ADDRESS, SMS_TO, msg.as_string())
+    try:
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+            server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+            server.sendmail(EMAIL_ADDRESS, SMS_TO, msg.as_string())
+    except Exception as e:
+        print("Failed to send SMS:", e)
 
 # --- Store detection ---
 def get_store(url):
-    hostname = urlparse(url).hostname
+    hostname = urlparse(url).hostname or ""
     if "amazon.com" in hostname:
         return "Amazon"
     elif "walmart.com" in hostname:
@@ -265,15 +272,15 @@ def check_price(pid, product):
             send_sms(f"Deal Alert! ${price}\n{product['url']}")
             product["last_alert"] = time.time()
             save_product_to_db(pid)
-    except:
-        pass
+    except Exception as e:
+        print("Price check failed:", e)
 
 def monitor():
     while True:
         for pid, product in list(products.items()):
             check_price(pid, product)
             time.sleep(30)  # staggered
-        time.sleep(570)  # wait remaining ~10 minutes for loop
+        time.sleep(570)  # remaining time to ~10 minutes
 
 # --- Startup ---
 init_db()
@@ -281,4 +288,5 @@ load_products()
 threading.Thread(target=monitor, daemon=True).start()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
