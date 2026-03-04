@@ -8,6 +8,7 @@ from flask import Flask, request, render_template_string, redirect
 from bs4 import BeautifulSoup
 import uuid
 from urllib.parse import urlparse
+import sqlite3
 import re
 
 app = Flask(__name__)
@@ -17,8 +18,10 @@ EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 SMS_TO = os.getenv("SMS_TO")
 
-products = {}
+DB_FILE = "products.db"
+products = {}  # key=UUID, value=dict
 
+# --- HTML templates ---
 HTML = """
 <h2>Add Product</h2>
 <form method="post" action="/add">
@@ -59,6 +62,62 @@ Target Price: <input name="price" value="{{p['target']}}" required><br>
 </form>
 """
 
+# --- Database functions ---
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS products (
+            id TEXT PRIMARY KEY,
+            name TEXT,
+            url TEXT,
+            store TEXT,
+            target REAL,
+            last_alert REAL,
+            current_price REAL,
+            notifications_on INTEGER
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def load_products():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT * FROM products")
+    rows = c.fetchall()
+    for row in rows:
+        pid, name, url, store, target, last_alert, current_price, notifications_on = row
+        products[pid] = {
+            "name": name,
+            "url": url,
+            "store": store,
+            "target": target,
+            "last_alert": last_alert,
+            "current_price": current_price,
+            "notifications_on": bool(notifications_on)
+        }
+    conn.close()
+
+def save_product_to_db(pid):
+    p = products[pid]
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''
+        INSERT OR REPLACE INTO products (id,name,url,store,target,last_alert,current_price,notifications_on)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (pid, p['name'], p['url'], p['store'], p['target'], p['last_alert'], p['current_price'], int(p['notifications_on'])))
+    conn.commit()
+    conn.close()
+
+def delete_product_from_db(pid):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM products WHERE id=?", (pid,))
+    conn.commit()
+    conn.close()
+
+# --- Email/SMS ---
 def send_sms(message):
     msg = MIMEText(message)
     msg['Subject'] = "Price Alert!"
@@ -68,6 +127,7 @@ def send_sms(message):
         server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
         server.sendmail(EMAIL_ADDRESS, SMS_TO, msg.as_string())
 
+# --- Store detection ---
 def get_store(url):
     hostname = urlparse(url).hostname
     if "amazon.com" in hostname:
@@ -83,7 +143,7 @@ def get_store(url):
     else:
         return "Unknown"
 
-# Robust price parsers
+# --- Price parsers ---
 def get_price_amazon(soup):
     tag = soup.select_one("#priceblock_ourprice, #priceblock_dealprice")
     return float(tag.text.replace("$","").replace(",","")) if tag else None
@@ -97,37 +157,30 @@ def get_price_target(soup):
     return float(tag.text.replace("$","").replace(",","")) if tag else None
 
 def get_price_bestbuy(soup):
-    # Hero price
     tag = soup.select_one("div.priceView-hero-price span")
     if tag and "$" in tag.text:
         return float(tag.text.strip().replace("$","").replace(",",""))
-    # Alternate price span
     tag_alt = soup.select_one("span.price")
     if tag_alt and "$" in tag_alt.text:
         return float(tag_alt.text.strip().replace("$","").replace(",",""))
-    # Fallback
     for span in soup.find_all("span"):
         if "$" in span.text:
             try:
                 return float(span.text.strip().replace("$","").replace(",",""))
-            except:
-                continue
+            except: continue
     return None
 
 def get_price_microcenter(soup):
     tag = soup.select_one("span[id='pricing']")
     if tag:
         match = re.search(r"\d+(\.\d+)?", tag.text.replace(",",""))
-        if match:
-            return float(match.group())
+        if match: return float(match.group())
     for span in soup.find_all("span"):
         if "$" in span.text:
             try:
                 match = re.search(r"\d+(\.\d+)?", span.text.replace(",",""))
-                if match:
-                    return float(match.group())
-            except:
-                continue
+                if match: return float(match.group())
+            except: continue
     return None
 
 def extract_price(url, soup):
@@ -144,6 +197,7 @@ def extract_price(url, soup):
         return get_price_microcenter(soup)
     return None
 
+# --- Flask routes ---
 @app.route("/", methods=["GET"])
 def home():
     return render_template_string(HTML, products=products)
@@ -166,15 +220,17 @@ def add_product():
         "current_price": None,
         "notifications_on": True
     }
+    save_product_to_db(pid)
     return redirect("/")
 
 @app.route("/remove/<pid>", methods=["GET"])
 def remove_product(pid):
     if pid in products:
         del products[pid]
+        delete_product_from_db(pid)
     return redirect("/")
 
-@app.route("/edit/<pid>", methods=["GET", "POST"])
+@app.route("/edit/<pid>", methods=["GET","POST"])
 def edit_product(pid):
     if pid not in products:
         return redirect("/")
@@ -183,6 +239,7 @@ def edit_product(pid):
         products[pid]["url"] = request.form["url"]
         products[pid]["target"] = float(request.form["price"])
         products[pid]["store"] = get_store(request.form["url"])
+        save_product_to_db(pid)
         return redirect("/")
     return render_template_string(EDIT_HTML, p=products[pid])
 
@@ -190,9 +247,11 @@ def edit_product(pid):
 def toggle_notifications(pid):
     if pid in products:
         products[pid]["notifications_on"] = "notify" in request.form
+        save_product_to_db(pid)
     return redirect("/")
 
-def check_price(product):
+# --- Price monitoring ---
+def check_price(pid, product):
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         r = requests.get(product["url"], headers=headers, timeout=10)
@@ -201,18 +260,24 @@ def check_price(product):
         if price is None:
             return
         product["current_price"] = price
+        save_product_to_db(pid)
         if price <= product["target"] and product["notifications_on"] and time.time() - product["last_alert"] > 86400:
             send_sms(f"Deal Alert! ${price}\n{product['url']}")
             product["last_alert"] = time.time()
+            save_product_to_db(pid)
     except:
         pass
 
 def monitor():
     while True:
-        for product in list(products.values()):
-            check_price(product)
-            time.sleep(30)
+        for pid, product in list(products.items()):
+            check_price(pid, product)
+            time.sleep(30)  # staggered
+        time.sleep(570)  # wait remaining ~10 minutes for loop
 
+# --- Startup ---
+init_db()
+load_products()
 threading.Thread(target=monitor, daemon=True).start()
 
 if __name__ == "__main__":
